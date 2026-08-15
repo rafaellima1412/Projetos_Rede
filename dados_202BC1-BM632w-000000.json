@@ -1,0 +1,23 @@
+{
+  "identificacao": {
+    "id": "202BC1-BM632w-000000",
+    "fabricante": "N/A",
+    "modelo": "N/A",
+    "numero_serie": "N/A",
+    "versao_firmware": "V100R001IRQC56B017",
+    "uptime_segundos": "N/A"
+  },
+  "rede_wan": {
+    "ip_externo": "172.3.89.139",
+    "status_conexao": "N/A",
+    "connection_request_url": "http://172.18.0.4:50459/"
+  },
+  "wifi_2g": {
+    "ssid": "404 WiMAX Not Found",
+    "ativo": "N/A"
+  },
+  "sinal_optico": {
+    "rx_power_dbm": "N/A",
+    "tx_power_dbm": "N/A"
+  }
+}
