@@ -1,7 +1,7 @@
 {
-  "name": "genieacs-consumer",
+  "name": "consumer",
   "version": "1.0.0",
-  "description": "Consumer Kafka -> Postgres + Redis, calcula funil de sucesso de instalação",
+  "description": "Consumer: Kafka (device-events) -> Postgres (histórico) + Redis (estado atual). Detecta condições de alerta e publica em alertas-ftt.",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {

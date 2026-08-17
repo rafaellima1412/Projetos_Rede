@@ -1,81 +1,88 @@
 -- ========================================================
--- Funil de sucesso de instalação por CPE
--- Etapas 1-4: alimentadas automaticamente pelo Consumer (Kafka)
--- Etapas 5-6: simuladas/manuais por enquanto (sem sistema de
---             chamados real integrado ainda)
+-- Installation success funnel, per CPE
+-- Stages 1-4: fed automatically by the Consumer (Kafka)
+-- Stages 5-6: simulated/manual for now (no real ticketing
+--             system integrated yet)
 -- ========================================================
 
 CREATE TABLE device_lifecycle (
-    device_id               TEXT PRIMARY KEY,
+    device_id                 TEXT PRIMARY KEY,
 
-    -- Etapa 1: Instalação concluída
-    instalacao_concluida_em TIMESTAMPTZ,
+    -- Stage 1: Installation completed
+    installation_completed_at TIMESTAMPTZ,
 
-    -- Etapa 2: CPE provisionado (provision rodou sem erro no GenieACS)
-    provisionado_em         TIMESTAMPTZ,
+    -- Stage 2: CPE provisioned (first successful contact with GenieACS)
+    provisioned_at            TIMESTAMPTZ,
 
-    -- Etapa 3: Teste de conectividade OK (IPPing/status WAN)
-    conectividade_ok_em     TIMESTAMPTZ,
+    -- Stage 3: Connectivity confirmed (WAN connected / ping OK)
+    connectivity_ok_at        TIMESTAMPTZ,
 
-    -- Etapa 4: acompanhamento contínuo de degradação
-    ultimo_score_qualidade  INTEGER,          -- 0-100, o mesmo score que já calculamos
-    ultima_verificacao_em   TIMESTAMPTZ,
-    degradacao_detectada    BOOLEAN DEFAULT FALSE,
+    -- Stage 4: ongoing degradation monitoring
+    last_quality_score        INTEGER,          -- 0-100
+    last_checked_at           TIMESTAMPTZ,
+    degradation_detected      BOOLEAN DEFAULT FALSE,
 
-    -- Etapa 5: visita técnica (SIMULADO por enquanto)
-    ultima_visita_tecnica_em TIMESTAMPTZ,
+    -- Stage 5: technical visit (SIMULATED for now)
+    last_technical_visit_at   TIMESTAMPTZ,
 
-    -- Etapa 6: chamado de suporte (SIMULADO por enquanto)
-    ultimo_chamado_suporte_em TIMESTAMPTZ,
+    -- Stage 6: support ticket (SIMULATED for now)
+    last_support_ticket_at    TIMESTAMPTZ,
 
-    criado_em                TIMESTAMPTZ DEFAULT now(),
-    atualizado_em             TIMESTAMPTZ DEFAULT now()
+    created_at                TIMESTAMPTZ DEFAULT now(),
+    updated_at                TIMESTAMPTZ DEFAULT now()
 );
 
--- Histórico bruto de todos os eventos recebidos do Kafka
--- (etapas 1-4 são derivadas daqui + atualizam device_lifecycle)
+-- Raw history of every event received from Kafka.
+-- Stages 1-4 above are derived from here (the consumer updates
+-- device_lifecycle whenever it processes one of these events).
+-- Also doubles as the alert log: transitions like disconnection,
+-- unexpected reboot, or signal out of range are logged here with
+-- their own event_type, no separate alerts table needed.
 CREATE TABLE device_events (
     id          BIGSERIAL PRIMARY KEY,
     device_id   TEXT NOT NULL,
-    event_type  TEXT NOT NULL,      -- ex: 'inform', 'provision_ok', 'ping_ok'
+    event_type  TEXT NOT NULL,      -- 'inform', 'installation_completed', 'provision_ok',
+                                     -- 'ping_ok', 'disconnection_detected', 'unexpected_reboot',
+                                     -- 'signal_degraded'
     payload     JSONB NOT NULL,
-    recebido_em TIMESTAMPTZ DEFAULT now()
+    received_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX idx_device_events_device_id ON device_events (device_id);
-CREATE INDEX idx_device_events_recebido_em ON device_events (recebido_em);
+CREATE INDEX idx_device_events_received_at ON device_events (received_at);
+CREATE INDEX idx_device_events_event_type ON device_events (event_type);
 
--- Tabela de "chamados/visitas" simulados -- por enquanto você
--- insere manualmente aqui pra testar a lógica do funil, até ter
--- um sistema real de ticketing pra integrar
-CREATE TABLE tickets_simulados (
+-- "Tickets/visits" table -- for now you insert manually here to
+-- test the funnel logic, until there's a real ticketing system
+-- to integrate.
+CREATE TABLE simulated_tickets (
     id          BIGSERIAL PRIMARY KEY,
     device_id   TEXT NOT NULL,
-    tipo        TEXT NOT NULL CHECK (tipo IN ('visita_tecnica', 'chamado_suporte')),
-    descricao   TEXT,
-    criado_em   TIMESTAMPTZ DEFAULT now()
+    type        TEXT NOT NULL CHECK (type IN ('technical_visit', 'support_ticket')),
+    description TEXT,
+    created_at  TIMESTAMPTZ DEFAULT now()
 );
 
 -- ========================================================
--- View: calcula o status do funil em tempo real por CPE
+-- View: real-time funnel status per CPE
 -- ========================================================
-CREATE VIEW funil_sucesso_instalacao AS
+CREATE VIEW installation_success_funnel AS
 SELECT
     dl.device_id,
-    dl.instalacao_concluida_em IS NOT NULL                                  AS etapa1_instalacao,
-    dl.provisionado_em IS NOT NULL                                          AS etapa2_provisionado,
-    dl.conectividade_ok_em IS NOT NULL                                      AS etapa3_conectividade,
-    NOT dl.degradacao_detectada                                             AS etapa4_sem_degradacao,
-    dl.ultima_visita_tecnica_em IS NULL
-        OR dl.ultima_visita_tecnica_em < dl.instalacao_concluida_em         AS etapa5_sem_nova_visita,
-    dl.ultimo_chamado_suporte_em IS NULL
-        OR dl.ultimo_chamado_suporte_em < dl.instalacao_concluida_em        AS etapa6_sem_chamado,
-    (dl.instalacao_concluida_em IS NOT NULL
-        AND dl.provisionado_em IS NOT NULL
-        AND dl.conectividade_ok_em IS NOT NULL
-        AND NOT dl.degradacao_detectada
-        AND (dl.ultima_visita_tecnica_em IS NULL OR dl.ultima_visita_tecnica_em < dl.instalacao_concluida_em)
-        AND (dl.ultimo_chamado_suporte_em IS NULL OR dl.ultimo_chamado_suporte_em < dl.instalacao_concluida_em)
-        AND dl.instalacao_concluida_em < now() - INTERVAL '30 days'
-    ) AS instalacao_bem_sucedida
+    dl.installation_completed_at IS NOT NULL                             AS stage1_installation,
+    dl.provisioned_at IS NOT NULL                                        AS stage2_provisioned,
+    dl.connectivity_ok_at IS NOT NULL                                    AS stage3_connectivity,
+    NOT dl.degradation_detected                                         AS stage4_no_degradation,
+    dl.last_technical_visit_at IS NULL
+        OR dl.last_technical_visit_at < dl.installation_completed_at     AS stage5_no_new_visit,
+    dl.last_support_ticket_at IS NULL
+        OR dl.last_support_ticket_at < dl.installation_completed_at      AS stage6_no_ticket,
+    (dl.installation_completed_at IS NOT NULL
+        AND dl.provisioned_at IS NOT NULL
+        AND dl.connectivity_ok_at IS NOT NULL
+        AND NOT dl.degradation_detected
+        AND (dl.last_technical_visit_at IS NULL OR dl.last_technical_visit_at < dl.installation_completed_at)
+        AND (dl.last_support_ticket_at IS NULL OR dl.last_support_ticket_at < dl.installation_completed_at)
+        AND dl.installation_completed_at < now() - INTERVAL '30 days'
+    ) AS installation_successful
 FROM device_lifecycle dl;
