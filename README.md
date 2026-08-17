@@ -1,134 +1,97 @@
-# Projetos_Rede — Laboratório TR-069/TR-181 (GenieACS)
+# Projetos_Rede
 
-Ambiente de estudo/laboratório para entender, na prática, como funciona o gerenciamento remoto de CPEs (roteadores, ONTs, gateways) via **TR-069/CWMP**, usando o **TR-181** como modelo de dados — evoluindo até uma arquitetura de eventos capaz de responder, por CPE, se uma instalação foi realmente bem-sucedida.
+Pipeline de coleta e processamento de dados de CPEs via TR-069, usando GenieACS como ACS, com ingestão de eventos via Kafka e persistência para análise (funil de sucesso / FTT operacional).
 
-## Objetivo final
+## Objetivo
 
-Responder, de forma automatizada, ao seguinte funil por cliente:
-
-```
-Instalação concluída → CPE provisionado → Teste de conectividade OK →
-Sem degradação relevante → Sem nova visita técnica → Sem chamado em 30 dias
-→ ✅ Instalação bem-sucedida
-```
-
-## O que este projeto demonstra
-
-- Como um ACS (Auto Configuration Server) gerencia CPEs remotamente via TR-069
-- Como o modelo de dados TR-181 estrutura parâmetros (estatísticas, diagnósticos, Wi-Fi, sinal óptico, etc)
-- Como escalar um ACS horizontalmente em cluster — e a pegadinha real disso (sessão CWMP presa ao processo, exige sticky session)
-- Como desenhar um pipeline orientado a eventos: **Event Ingestor → Fila de eventos → Consumers independentes**, cada um no seu ritmo e com seu propósito
-- Como transformar eventos técnicos brutos num funil de negócio (sucesso de instalação)
+Coletar dados técnicos dos CPEs (status de conexão, sinal óptico, tráfego, firmware etc.) via TR-069 e transformar isso em indicadores operacionais — o principal sendo o **FTT (First Time Through) Operacional**, que cruza dados técnicos do CPE com eventos de processo (OS, chamados, ativação) pra medir se a jornada do cliente funcionou corretamente já na primeira tentativa, sem depender só do que a equipe registrou manualmente.
 
 ## Arquitetura
 
-![Arquitetura atual do projeto](arquitetura_atual.svg)
+```
+CPEs (ONU/Router)
+   │  TR-069 (porta 7547)
+   ▼
+NGINX (LB) ──┬── GenieACS instância 1
+             └── GenieACS instância 2
+                       │
+                       ▼
+                  MongoDB (compartilhado)
+                       ▲
+                       │  polling NBI (delta por _lastInform)
+                  ingestor  ← cursor de polling salvo no Redis
+                       │
+                       ▼
+                Kafka (tópico device-events)
+                       │
+                       ▼
+                  consumer
+                   ├──► PostgreSQL (histórico / funil de sucesso)
+                   ├──► Redis (cache do último estado de cada CPE)
+                   └──► Kafka (tópico alertas-ftt, só quando detecta
+                        problema: FTT quebrado, degradação, reincidência)
+                                   │
+                                   ▼
+                        n8n (Kafka Trigger no tópico alertas-ftt)
+                                   │
+                                   ▼
+                        Slack / e-mail / ticket no CRM
+```
 
-*(Diagrama gerado a partir do que já foi validado ponta a ponta em Ago/2026 — substitui os diagramas conceituais anteriores, que mostravam a arquitetura pretendida para 10 mil CPEs, não o estado real do lab.)*
+**Por que essa divisão:** o `ingestor` precisa aguentar volume alto (milhares de CPEs informando com frequência) — por isso é um serviço fino, sem overhead de motor de workflow. O n8n só entra depois que o volume já foi filtrado pelas regras de FTT, quando o que sobra são poucos eventos realmente relevantes por hora — aí sim ele é a ferramenta certa, porque orquestrar uma notificação/ação não exige alta vazão.
 
-**Status real de cada peça:**
+Diagramas visuais de referência: `arquitetura.png`, `arq2.png`, `arquitetura_10k_cpes.png`, `arquitetura_10k_cpes_v2.png`.
 
-| Peça | Status |
+## Componentes
+
+| Serviço | Função |
 |---|---|
-| Nginx com sticky session (`ip_hash`) na porta CWMP | ✅ Validado |
-| Cluster GenieACS (2 instâncias, MongoDB compartilhado) | ✅ Validado |
-| Data model estendido (parâmetros TR-181 customizados) | ✅ Validado |
-| Event Ingestor (`publish_kafka.js`) publicando direto no Kafka | ✅ Validado |
-| Consumer Node.js → PostgreSQL + Redis | ✅ Validado |
-| Funil de sucesso de instalação (`funil_sucesso_instalacao`) | ✅ Schema pronto, alimentado pelo Consumer |
-| Workflow n8n com Kafka Trigger (alertas) | 🔶 Pendente |
-| Integração com sistema real de chamados/visitas | 🔶 Pendente (hoje simulado em `tickets_simulados`) |
+| `genieacs` / `genieacs-2` | ACS (Auto Configuration Server) TR-069, via GenieACS. Duas instâncias compartilhando o mesmo MongoDB, atrás do NGINX |
+| `nginx` | Load balancer. Porta 7547 (CWMP, onde os CPEs falam com o ACS) usa `ip_hash` — necessário porque uma sessão CWMP é uma troca de várias mensagens que precisa ficar na mesma instância. Portas 7557 (NBI), 7567 (FS) e 3000 (UI) usam round-robin simples, por serem stateless |
+| `mongo` | Banco de dados do GenieACS — árvore de parâmetros de cada CPE |
+| `kafka` / `kafka-ui` | Fila de eventos (modo KRaft, sem Zookeeper). `kafka-ui` é só o painel web pra inspecionar tópicos e mensagens |
+| `ingestor` | Serviço próprio (`./ingestor`), Node.js. Faz polling incremental na NBI do GenieACS (dispositivos com `_lastInform` mais recente que o último cursor salvo no Redis) e publica um evento por CPE no tópico `device-events`. É a camada de alto volume — sem motor de workflow, sem histórico de execução por evento |
+| `n8n` | Orquestrador de alertas de baixo volume. Escuta o tópico `alertas-ftt` (via Kafka Trigger node, configurado na UI do n8n) e dispara ação — Slack, e-mail, ticket no CRM. Só recebe o que o `consumer` já filtrou como relevante, não o fluxo bruto de eventos |
+| `consumer` | Serviço próprio (`./consumer`), Node.js. Consome `device-events`, grava histórico bruto em `device_events` e atualiza o funil por CPE em `device_lifecycle`. Pra eventos `inform`, compara com o último estado (Redis) pra detectar desconexão, reboot inesperado e sinal fora da faixa — quando detecta, loga como um `device_events` próprio e publica em `alertas-ftt` |
+| `postgres` | Banco `genieacs_funil`. Tabelas: `device_lifecycle` (funil de sucesso por CPE, etapas 1-6), `device_events` (histórico bruto, inclui os alertas como tipo de evento), `simulated_tickets` (visitas/chamados simulados até integrar um sistema real). View `installation_success_funnel` calcula o status do funil em tempo real |
+| `redis` | Cache da última telemetria conhecida de cada CPE — usado pelo `consumer` só pra comparar e detectar transições (desconexão, reboot), não é fonte de verdade |
 
-```
-CPEs simulados (genieacs-sim, 100 devices)
-        ↓
-Nginx (load balancer, sticky session via ip_hash na porta CWMP)
-        ↓
-Cluster GenieACS (2 instâncias, MongoDB compartilhado)
-        ↓
-Event Ingestor (extension publish_kafka.js — publica direto via kafkajs)
-        ↓
-Kafka (tópico device-events)
-        ↓
-   ┌─────────────────────────┬──────────────────────────────┐
-   ↓                         ↓
-Consumer (Node.js)      n8n — Kafka Trigger (pendente)
-   ├── PostgreSQL            └── Alertas de degradação
-   │    ├── device_events
-   │    ├── device_lifecycle
-   │    └── funil_sucesso_instalacao (view)
-   └── Redis (cache do último estado, TTL 1h)
-```
+## Scripts auxiliares
 
-### Decisões técnicas e por quê
-
-**Event Ingestor separado do Consumer.** A extension do GenieACS (`publish_kafka.js`) só tem uma responsabilidade: pegar o evento bruto do Inform e publicar no Kafka, já formatado. Ela não sabe nada sobre Postgres, Redis ou regras de negócio — isso é papel do Consumer, mais à frente na cadeia.
-
-**Por que o n8n saiu do caminho de ingestão.** Inicialmente o GenieACS notificava o n8n via webhook, que publicava no Kafka. Com carga de eventos (múltiplos CPEs enviando Inform quase simultaneamente), esse hop HTTP extra virou gargalo desnecessário. A extension agora publica **direto** no Kafka via `kafkajs`. O n8n ficou reservado só para consumo de baixo volume — alertas e automações — onde o overhead de um workflow visual não é problema.
-
-**Múltiplos consumers independentes no mesmo tópico.** O Consumer em Node.js (grupo `consumer-postgres-redis`) e o futuro workflow do n8n (via Kafka Trigger) leem o **mesmo** tópico `device-events`, cada um com seu próprio consumer group — um não bloqueia nem depende do outro.
-
-**Cada destino de dado com um propósito diferente:**
-| Destino | O que grava | Por quê |
-|---|---|---|
-| PostgreSQL | Todo evento, sempre (`device_events`) + estado do funil (`device_lifecycle`) | Histórico completo, auditável, consultas históricas |
-| Redis | Só o último estado de cada CPE, com expiração de 1h | Cache rápido, não serve pra histórico |
-| n8n | Só quando degradação é detectada | Mantém baixo volume, evita gargalo |
-
-**Sticky session no load balancer.** Uma sessão CWMP é uma sequência de múltiplas trocas HTTP que precisa ser atendida pela **mesma instância** do GenieACS do início ao fim — o contexto fica vinculado ao processo, não é compartilhado entre instâncias via MongoDB. Sem `ip_hash` na porta CWMP, ocorre o erro `Invalid session`.
-
-## O funil de sucesso de instalação
-
-A tabela `device_lifecycle` e a view `funil_sucesso_instalacao` (em `schema.sql`) rastreiam, por CPE:
-
-1. **Instalação concluída** e **2. CPE provisionado** — alimentados automaticamente pelo Consumer a partir dos eventos do Kafka
-2. **Teste de conectividade OK** — calculado a partir do status da conexão WAN (TR-181)
-3. **Sem degradação relevante** — score de qualidade calculado a partir de sinal óptico, uptime, status WAN e Wi-Fi
-4. **Sem nova visita técnica** e **6. Sem chamado em 30 dias** — hoje **simulados/manuais** na tabela `tickets_simulados` (o projeto ainda não integra um sistema real de ticketing/CRM — a estrutura já está pronta pra isso no futuro)
+- `coletor_cpe.py`: coleta pontual e manual de dados de um CPE específico direto na NBI do GenieACS (TR-098/TR-181) — identificação, WAN, Wi-Fi, sinal óptico. Útil pra debug e inspeção ad-hoc, roda fora do pipeline de eventos
+- `notify_provision.js`: hook de notificação de provisionamento
+- `extensions/`: extensões customizadas do GenieACS
 
 ## Como rodar
 
-Pré-requisitos: Docker e Docker Compose.
-
 ```bash
-docker compose up -d --build
-docker compose --profile testing up -d   # sobe os CPEs simulados
+docker compose up -d
 ```
 
-Serviços disponíveis:
+Serviços expostos no host:
+- `7547` — CWMP (CPEs se conectam aqui)
+- `7557` — NBI (API administrativa)
+- `7567` — FS (firmware)
+- `3000` — GenieACS UI
+- `5678` — n8n
+- `8081` — Kafka UI
+- `5432` — Postgres (só em `127.0.0.1`)
 
-| Serviço | URL/Porta | O que é |
-|---|---|---|
-| GenieACS UI | http://localhost:3000 | Interface de administração (via Nginx) |
-| GenieACS NBI | http://localhost:7557 | API REST pra scripts/automação |
-| GenieACS CWMP | :7547 | Porta onde os CPEs se conectam |
-| Kafka UI | http://localhost:8081 | Visualizar tópicos/mensagens do Kafka |
-| n8n | http://localhost:5678 | Automações e alertas |
-| MongoDB | :27017 (localhost) | Banco do GenieACS (ex: pra conectar via Compass) |
-| PostgreSQL | :5432 (localhost) | Histórico de eventos e funil de sucesso |
+## Estado atual e limitações conhecidas
 
-## Estrutura do repositório
+- **Credenciais hardcoded** (`GENIEACS_UI_JWT_SECRET=changeme`, usuário/senha padrão do Postgres) — trocar antes de qualquer ambiente exposto
+- **MongoDB é instância única**, sem replicação — ponto único de falha e de capacidade. Não escala automaticamente ao adicionar mais instâncias de `genieacs-N`
+- **Kafka roda com 1 broker e replication factor 1** — sem redundância. Além disso, o tópico `device-events` precisa de partições configuradas explicitamente pra permitir múltiplas réplicas do `consumer` processando em paralelo
+- **`ip_hash` no NGINX depende de os CPEs terem IP de origem variado.** Se a base de clientes estiver atrás de CGNAT da própria operadora, `ip_hash` pode concentrar tráfego de forma desigual entre as instâncias — vale monitorar a contagem de dispositivos online por instância
 
-| Arquivo/Pasta | Descrição |
-|---|---|
-| `docker-compose.yml` | Orquestração de todos os serviços |
-| `nginx.conf` | Load balancer com sticky session (`ip_hash`) na porta CWMP |
-| `data_model_extended.csv` | Data model do `genieacs-sim` estendido com parâmetros TR-181 customizados |
-| `extensions/publish_kafka.js` | Event Ingestor — publica eventos direto no Kafka |
-| `notify_provision.js` | Provisioning script que dispara a extension a cada Inform |
-| `schema.sql` | Schema do Postgres: histórico, funil de sucesso e tickets simulados |
-| `consumer/` | Consumer Node.js: Kafka → Postgres + Redis |
-| `coletor_cpe.py` | Script Python de exemplo pra consultar dados de um CPE via NBI |
-| `arquitetura_atual.svg` | Diagrama da arquitetura validada (este README) |
+## Roadmap
 
-## Próximos passos
-
-- [ ] Workflow n8n dedicado a alertas (Kafka Trigger → filtro de degradação → notificação)
-- [ ] Integrar sistema real de chamados/visitas técnicas (substituindo `tickets_simulados`)
-- [ ] Testes de carga com volume maior de CPEs simulados
-- [ ] Dashboard consumindo a view `funil_sucesso_instalacao`
-
-## Contexto
-
-Projeto desenvolvido como estudo prático de TR-069/TR-181, evoluindo de um script simples de coleta de dados até uma arquitetura orientada a eventos para acompanhar o sucesso de instalações em escala.
-
+- [ ] Etapas 5 e 6 do funil (`last_technical_visit_at`, `last_support_ticket_at`) hoje só são preenchidas manualmente via `simulated_tickets` — integrar com sistema de chamados real quando existir
+- [ ] Calibrar os pesos do `calculateQualityScore()` no `consumer` — hoje é uma heurística simples (100 se conectado e sinal na faixa, 40 pontos a menos se sinal degradado, 0 se desconectado), ainda não validada com dado real
+- [ ] Configurar o workflow de alerta no n8n (Kafka Trigger node no tópico `alertas-ftt` → Slack/e-mail/CRM)
+- [ ] MongoDB como replica set (3 nós) antes de crescer a base de CPEs
+- [ ] Particionar tópico `device-events` e rodar múltiplas réplicas do `consumer`
+- [ ] Adicionar coleta de contadores de tráfego (bytes/pacotes) e diagnósticos ativos (ping, download/upload) — hoje o `coletor_cpe.py`/`ingestor` cobrem identificação, WAN, Wi-Fi e sinal óptico, mas não contadores nem diagnóstico sob demanda
+- [ ] Gatilho de scale-out do ACS baseado em métrica real (CPU/latência do `genieacs-cwmp`), não em contagem antecipada de CPEs
+- [ ] Ajustar `POLL_INTERVAL_MS` do `ingestor` com base em volume real observado — 10s é ponto de partida, não valor validado em carga
+- [ ] Calibrar `RX_POWER_MIN_DBM`/`RX_POWER_MAX_DBM` por vendor de ONU se a base tiver equipamentos heterogêneos — hoje é uma faixa única para todos os CPEs

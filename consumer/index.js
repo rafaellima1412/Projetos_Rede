@@ -1,183 +1,253 @@
-const { Kafka } = require("kafkajs");
-const { Pool } = require("pg");
-const Redis = require("ioredis");
-const http = require("http");
+/**
+ * Consumer: device-events (Kafka) -> device_events + device_lifecycle (Postgres)
+ *
+ * Cada mensagem do Kafka já chega com um event_type ('inform',
+ * 'installation_completed', 'provision_ok', 'ping_ok'). O consumer:
+ *   1. grava a mensagem crua em device_events (histórico completo)
+ *   2. atualiza device_lifecycle de acordo com o event_type
+ *   3. no caso de 'inform', compara com o último estado (Redis) pra
+ *      detectar degradação/desconexão/reboot e loga isso também como
+ *      um device_events (event_type próprio), publicando em
+ *      alertas-ftt se algo mudou de patamar
+ *
+ * Não existe tabela separada de "estado atual" ou "alertas" -- o
+ * device_lifecycle já cobre o resumo por CPE, e o device_events já
+ * cobre o histórico bruto (alertas incluídos, como um tipo de evento
+ * a mais).
+ */
 
-// --- Configuração ---
-const KAFKA_BROKER = process.env.KAFKA_BROKER || "kafka:9092";
-const KAFKA_TOPIC = process.env.KAFKA_TOPIC || "device-events";
-const NBI_HOST = process.env.NBI_HOST || "nginx";
-const NBI_PORT = process.env.NBI_PORT || 7557;
+const { Kafka } = require('kafkajs');
+const { Pool } = require('pg');
+const Redis = require('ioredis');
 
-const pool = new Pool({
-  host: process.env.PG_HOST || "postgres",
-  port: process.env.PG_PORT || 5432,
-  user: process.env.PG_USER || "postgres",
-  password: process.env.PG_PASSWORD || "postgres",
-  database: process.env.PG_DATABASE || "genieacs_funil",
+const KAFKA_BROKER = process.env.KAFKA_BROKER || 'kafka:9092';
+const KAFKA_TOPIC = process.env.KAFKA_TOPIC || 'device-events';
+const KAFKA_ALERTS_TOPIC = process.env.KAFKA_ALERTS_TOPIC || 'alertas-ftt';
+const CONSUMER_GROUP_ID = process.env.CONSUMER_GROUP_ID || 'ftt-consumer-group';
+
+const PG_HOST = process.env.PG_HOST || 'postgres';
+const PG_PORT = process.env.PG_PORT || '5432';
+const PG_USER = process.env.PG_USER || 'postgres';
+const PG_PASSWORD = process.env.PG_PASSWORD || 'postgres';
+const PG_DATABASE = process.env.PG_DATABASE || 'genieacs_funil';
+
+const REDIS_HOST = process.env.REDIS_HOST || 'redis';
+const REDIS_PORT = process.env.REDIS_PORT || '6379';
+
+// Faixa aceitável de sinal óptico (dBm). Sem limiar universal --
+// ajustar por vendor/ONU se a base for heterogênea.
+const RX_POWER_MIN_DBM = parseFloat(process.env.RX_POWER_MIN_DBM || '-27');
+const RX_POWER_MAX_DBM = parseFloat(process.env.RX_POWER_MAX_DBM || '-8');
+
+const redis = new Redis({ host: REDIS_HOST, port: Number(REDIS_PORT) });
+
+const pgPool = new Pool({
+  host: PG_HOST,
+  port: Number(PG_PORT),
+  user: PG_USER,
+  password: PG_PASSWORD,
+  database: PG_DATABASE,
 });
 
-const redis = new Redis({
-  host: process.env.REDIS_HOST || "redis",
-  port: process.env.REDIS_PORT || 6379,
-});
+const kafka = new Kafka({ clientId: 'consumer', brokers: [KAFKA_BROKER] });
+const kafkaConsumer = kafka.consumer({ groupId: CONSUMER_GROUP_ID });
+const kafkaProducer = kafka.producer();
 
-const kafka = new Kafka({
-  clientId: "consumer-postgres-redis",
-  brokers: [KAFKA_BROKER],
-});
+function redisStateKey(deviceId) {
+  return `device:last_telemetry:${deviceId}`;
+}
 
-// Consumer group próprio -- separado do que o n8n vai usar pra alertas,
-// assim os dois leem o mesmo tópico de forma independente
-const consumer = kafka.consumer({ groupId: "consumer-postgres-redis" });
+function isConnected(connectionStatus) {
+  if (connectionStatus === null || connectionStatus === undefined) return null;
+  const normalized = String(connectionStatus).toLowerCase();
+  return normalized === 'connected' || normalized === 'up' || normalized === '1';
+}
 
-// --- Helpers reaproveitados da lógica de score que já tínhamos no n8n ---
-function getParamValue(deviceData, path) {
-  const keys = path.split(".");
-  let current = deviceData;
-  for (const key of keys) {
-    if (current && typeof current === "object" && key in current) {
-      current = current[key];
-    } else {
-      return null;
+function isRxPowerOutOfRange(rxPowerDbm) {
+  if (rxPowerDbm === null || rxPowerDbm === undefined) return false;
+  const value = Number(rxPowerDbm);
+  if (Number.isNaN(value)) return false;
+  return value < RX_POWER_MIN_DBM || value > RX_POWER_MAX_DBM;
+}
+
+// Heurística simples de score de qualidade (0-100). Ponto de
+// partida documentado -- ajustar pesos conforme dado real.
+function calculateQualityScore(payload) {
+  let score = 100;
+  const connected = isConnected(payload.connection_status);
+  if (connected === false) {
+    return 0;
+  }
+  if (isRxPowerOutOfRange(payload.rx_power_dbm)) {
+    score -= 40;
+  }
+  return Math.max(0, score);
+}
+
+async function ensureLifecycleRow(deviceId) {
+  await pgPool.query(
+    `INSERT INTO device_lifecycle (device_id)
+     VALUES ($1)
+     ON CONFLICT (device_id) DO NOTHING`,
+    [deviceId]
+  );
+}
+
+async function logEvent(deviceId, eventType, payload, receivedAt) {
+  await pgPool.query(
+    `INSERT INTO device_events (device_id, event_type, payload, received_at)
+     VALUES ($1, $2, $3, COALESCE($4, now()))`,
+    [deviceId, eventType, JSON.stringify(payload || {}), receivedAt || null]
+  );
+}
+
+async function handleInform(deviceId, payload, receivedAt) {
+  const previousRaw = await redis.get(redisStateKey(deviceId));
+  const previous = previousRaw ? JSON.parse(previousRaw) : null;
+
+  const qualityScore = calculateQualityScore(payload);
+  const degraded = qualityScore < 100;
+
+  await pgPool.query(
+    `UPDATE device_lifecycle SET
+       last_quality_score = $2,
+       last_checked_at = COALESCE($3, now()),
+       degradation_detected = $4,
+       -- primeira vez que vemos o device = provisionamento confirmado
+       provisioned_at = COALESCE(provisioned_at, COALESCE($3, now())),
+       -- conectividade OK na primeira vez em que chega conectado
+       connectivity_ok_at = CASE
+         WHEN connectivity_ok_at IS NULL AND $5 = true THEN COALESCE($3, now())
+         ELSE connectivity_ok_at
+       END,
+       updated_at = now()
+     WHERE device_id = $1`,
+    [deviceId, qualityScore, receivedAt || null, degraded, isConnected(payload.connection_status) === true]
+  );
+
+  const alerts = [];
+  if (previous) {
+    if (isConnected(previous.connection_status) === true && isConnected(payload.connection_status) === false) {
+      alerts.push({ event_type: 'disconnection_detected', detail: { previous: previous.connection_status, current: payload.connection_status } });
+    }
+    const prevUptime = Number(previous.uptime_seconds);
+    const curUptime = Number(payload.uptime_seconds);
+    if (!Number.isNaN(prevUptime) && !Number.isNaN(curUptime) && curUptime < prevUptime) {
+      alerts.push({ event_type: 'unexpected_reboot', detail: { previous_uptime_seconds: prevUptime, current_uptime_seconds: curUptime } });
     }
   }
-  if (current && typeof current === "object" && "_value" in current) {
-    return current._value;
+  if (isRxPowerOutOfRange(payload.rx_power_dbm)) {
+    alerts.push({ event_type: 'signal_degraded', detail: { rx_power_dbm: payload.rx_power_dbm, expected_range: [RX_POWER_MIN_DBM, RX_POWER_MAX_DBM] } });
   }
-  return null;
+
+  for (const alert of alerts) {
+    await logEvent(deviceId, alert.event_type, alert.detail, receivedAt);
+  }
+  if (alerts.length) {
+    await kafkaProducer.send({
+      topic: KAFKA_ALERTS_TOPIC,
+      messages: alerts.map((a) => ({
+        key: deviceId,
+        value: JSON.stringify({ device_id: deviceId, ...a, timestamp: new Date().toISOString() }),
+      })),
+    });
+    console.log(`[consumer] ${alerts.length} alert(s) published to "${KAFKA_ALERTS_TOPIC}" for ${deviceId}`);
+  }
+
+  await redis.set(redisStateKey(deviceId), JSON.stringify(payload));
 }
 
-function readPath(raw, tr098Path, tr181Path) {
-  let val = getParamValue(raw, tr098Path);
-  if (val === null) val = getParamValue(raw, tr181Path);
-  return val;
+async function handleInstallationCompleted(deviceId, receivedAt) {
+  await pgPool.query(
+    `UPDATE device_lifecycle SET installation_completed_at = COALESCE($2, now()), updated_at = now()
+     WHERE device_id = $1`,
+    [deviceId, receivedAt || null]
+  );
 }
 
-function fetchDeviceFromNBI(deviceId) {
-  return new Promise((resolve, reject) => {
-    const query = encodeURIComponent(JSON.stringify({ _id: deviceId }));
-    const path = `/devices?query=${query}`;
-
-    http
-      .get({ hostname: NBI_HOST, port: NBI_PORT, path }, (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed[0] || null);
-          } catch (e) {
-            reject(e);
-          }
-        });
-      })
-      .on("error", reject);
-  });
+async function handleProvisionOk(deviceId, receivedAt) {
+  await pgPool.query(
+    `UPDATE device_lifecycle SET provisioned_at = COALESCE($2, now()), updated_at = now()
+     WHERE device_id = $1`,
+    [deviceId, receivedAt || null]
+  );
 }
 
-function calcularScore(raw) {
-  const rxPower = parseFloat(
-    readPath(
-      raw,
-      "InternetGatewayDevice.WANDevice.1.X_GPON_InterfaceConfig.RXPower",
-      "Device.Optical.Interface.1.OpticalSignalLevel"
-    )
+async function handlePingOk(deviceId, receivedAt) {
+  await pgPool.query(
+    `UPDATE device_lifecycle SET connectivity_ok_at = COALESCE($2, now()), updated_at = now()
+     WHERE device_id = $1`,
+    [deviceId, receivedAt || null]
   );
-  const uptime = parseInt(
-    readPath(raw, "InternetGatewayDevice.DeviceInfo.UpTime", "Device.DeviceInfo.UpTime"),
-    10
-  );
-  const statusConexao = readPath(
-    raw,
-    "InternetGatewayDevice.WANDevice.1.WANConnectionDevice.1.WANIPConnection.1.ConnectionStatus",
-    "Device.IP.Interface.1.Status"
-  );
-  const wifiAtivo = readPath(
-    raw,
-    "InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.Enable",
-    "Device.WiFi.SSID.1.Enable"
-  );
-
-  let score = 100;
-  if (!isNaN(rxPower) && (rxPower > -8 || rxPower < -27)) score -= 40;
-  if (!isNaN(uptime) && uptime < 300) score -= 25;
-  if (statusConexao && statusConexao !== "Connected") score -= 25;
-  if (wifiAtivo === false || wifiAtivo === "false" || wifiAtivo === "0") score -= 10;
-  score = Math.max(0, score);
-
-  return { score, rxPower, uptime, statusConexao, wifiAtivo };
 }
 
-// --- Processamento de cada evento ---
-async function processarEvento(deviceId, eventType, timestamp) {
-  // 1. Sempre grava o evento bruto (histórico completo)
-  await pool.query(
-    "INSERT INTO device_events (device_id, event_type, payload) VALUES ($1, $2, $3)",
-    [deviceId, eventType, JSON.stringify({ eventType, timestamp })]
-  );
-
-  // 2. Busca o estado atual do device na NBI pra calcular o score
-  const raw = await fetchDeviceFromNBI(deviceId);
-  if (!raw) {
-    console.log(`Device ${deviceId} não encontrado na NBI, pulando cálculo de score.`);
+async function processMessage(message) {
+  const event = JSON.parse(message.value.toString());
+  const deviceId = event.device_id;
+  if (!deviceId) {
+    console.warn('[consumer] event without device_id, skipping:', event);
     return;
   }
+  const eventType = event.event_type || 'inform';
+  const payload = event.payload || {};
+  const receivedAt = event.timestamp || null;
 
-  const { score, statusConexao } = calcularScore(raw);
-  const conectividadeOk = statusConexao === "Connected";
-  const degradacao = score < 60;
+  await ensureLifecycleRow(deviceId);
+  await logEvent(deviceId, eventType, payload, receivedAt);
 
-  // 3. Atualiza o funil de sucesso no Postgres (upsert)
-  await pool.query(
-    `INSERT INTO device_lifecycle (
-        device_id, instalacao_concluida_em, provisionado_em,
-        conectividade_ok_em, ultimo_score_qualidade,
-        ultima_verificacao_em, degradacao_detectada, atualizado_em
-     ) VALUES ($1, now(), now(), $2, $3, now(), $4, now())
-     ON CONFLICT (device_id) DO UPDATE SET
-        conectividade_ok_em = CASE
-            WHEN $2 THEN COALESCE(device_lifecycle.conectividade_ok_em, now())
-            ELSE device_lifecycle.conectividade_ok_em
-        END,
-        ultimo_score_qualidade = $3,
-        ultima_verificacao_em = now(),
-        degradacao_detectada = $4,
-        atualizado_em = now()`,
-    [deviceId, conectividadeOk, score, degradacao]
-  );
-
-  // 4. Atualiza o snapshot rápido no Redis (último estado, sem histórico)
-  await redis.set(
-    `cpe:${deviceId}`,
-    JSON.stringify({ score, statusConexao, degradacao, atualizado_em: new Date().toISOString() }),
-    "EX",
-    3600 // expira em 1h -- é cache, não histórico
-  );
-
-  console.log(`[OK] ${deviceId} -> score=${score} degradacao=${degradacao}`);
+  switch (eventType) {
+    case 'inform':
+      await handleInform(deviceId, payload, receivedAt);
+      break;
+    case 'installation_completed':
+      await handleInstallationCompleted(deviceId, receivedAt);
+      break;
+    case 'provision_ok':
+      await handleProvisionOk(deviceId, receivedAt);
+      break;
+    case 'ping_ok':
+      await handlePingOk(deviceId, receivedAt);
+      break;
+    default:
+      // Tipo desconhecido: já foi logado em device_events acima,
+      // não precisa de tratamento especial em device_lifecycle.
+      break;
+  }
 }
 
-// --- Loop principal ---
 async function main() {
-  await consumer.connect();
-  await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: false });
+  await pgPool.query('SELECT 1'); // falha rápido se o schema não existir ainda
+  await kafkaProducer.connect();
+  await kafkaConsumer.connect();
+  await kafkaConsumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: false });
 
-  await consumer.run({
+  console.log(`[consumer] consuming "${KAFKA_TOPIC}", group "${CONSUMER_GROUP_ID}"`);
+  console.log(`[consumer] alerts -> "${KAFKA_ALERTS_TOPIC}", accepted RX range: ${RX_POWER_MIN_DBM} to ${RX_POWER_MAX_DBM} dBm`);
+
+  await kafkaConsumer.run({
     eachMessage: async ({ message }) => {
       try {
-        const payload = JSON.parse(message.value.toString());
-        await processarEvento(payload.deviceId, payload.event, payload.timestamp);
+        await processMessage(message);
       } catch (err) {
-        console.error("Erro ao processar mensagem:", err.message);
+        console.error('[consumer] error processing message:', err.message);
       }
     },
   });
-
-  console.log(`Consumer rodando, escutando tópico "${KAFKA_TOPIC}"...`);
 }
 
+async function shutdown() {
+  console.log('[consumer] shutting down...');
+  await kafkaConsumer.disconnect().catch(() => {});
+  await kafkaProducer.disconnect().catch(() => {});
+  await pgPool.end().catch(() => {});
+  redis.disconnect();
+  process.exit(0);
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
 main().catch((err) => {
-  console.error("Erro fatal no Consumer:", err);
+  console.error('[consumer] fatal startup error:', err);
   process.exit(1);
 });

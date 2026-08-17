@@ -1,4 +1,5 @@
 services:
+
   ### GenieACS Container - Instância 1 ###
   genieacs:
     depends_on:
@@ -16,8 +17,7 @@ services:
       GENIEACS_DEBUG_FILE: /var/log/genieacs/genieacs-debug.yaml
       GENIEACS_EXT_DIR: /opt/genieacs/ext
       GENIEACS_MONGODB_CONNECTION_URL: mongodb://mongo/genieacs?authSource=admin
-    # Removido "ports" (publicação direta) -> agora só "expose",
-    # porque o Nginx é quem vai publicar as portas no host
+    # Sem "ports" -> o Nginx é quem publica as portas no host
     expose:
       - "7547"
       - "7557"
@@ -109,44 +109,6 @@ services:
       retries: 5
       start_period: 40s
 
-  ### THIS SERVICE IS JUST FOR TESTING ###
-  # Agora aponta pro Nginx (não direto pra uma instância),
-  # e usa -p para multiplicar quantos CPEs simulados sobem de uma vez
-  genieacs-sim:
-    depends_on:
-      nginx:
-        condition: service_started
-    image: drumsergio/genieacs-sim-container:latest
-    container_name: genieacs-sim
-    restart: unless-stopped
-    command: ["./genieacs-sim", "-u", "http://nginx:7547/", "-p", "100", "-w", "500", "-m", "/opt/genieacs-sim/data_model_extended.csv"]
-    volumes:
-      - ./data_model_extended.csv:/opt/genieacs-sim/data_model_extended.csv:ro
-    networks:
-      - genieacs_network
-    profiles:
-      - testing
-
-  ### GenieACS MCP Server (AI) ###
-  genieacs-mcp:
-    depends_on:
-      nginx:
-        condition: service_started
-    image: drumsergio/genieacs-mcp:latest
-    container_name: genieacs-mcp
-    restart: unless-stopped
-    environment:
-      ACS_URL: http://nginx:7557
-      ACS_USER: admin
-      ACS_PASS: admin # Set by default after the wizard, please change
-      TRANSPORT: http
-    ports:
-      - "8080:8080"
-    networks:
-      - genieacs_network
-    profiles:
-      - mcp
-
   ### Fila de eventos: Kafka (modo KRaft, sem Zookeeper) ###
   kafka:
     image: apache/kafka:latest
@@ -183,7 +145,39 @@ services:
     networks:
       - genieacs_network
 
-  ### n8n - orquestrador de workflows (ponte GenieACS -> Kafka) ###
+  ### Ingestor - GenieACS (NBI) -> Kafka ###
+  # Polling incremental: consulta dispositivos com _lastInform mais
+  # recente que o cursor salvo no Redis, publica 1 evento por CPE no
+  # tópico device-events. Serviço fino, sem motor de workflow, feito
+  # pra aguentar volume de milhares de CPEs informando com frequência
+  # -- esse é o papel que antes estava no n8n.
+  ingestor:
+    build: ./ingestor
+    container_name: ingestor
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      NBI_HOST: nginx
+      NBI_PORT: 7557
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: device-events
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POLL_INTERVAL_MS: 10000
+    networks:
+      - genieacs_network
+
+  ### n8n - alertas de baixo volume (NÃO é mais a ponte de ingestão) ###
+  # Consome o tópico alertas-ftt via Kafka Trigger node do próprio
+  # n8n (configurado na UI, não aqui no compose). Esse tópico só
+  # recebe o que o "consumer" já processou e decidiu ser relevante
+  # (FTT quebrado, degradação confirmada, reincidência) -- baixo
+  # volume por natureza, exatamente o cenário que o n8n aguenta bem.
+  # Dispara Slack/e-mail/ticket a partir daí.
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
@@ -252,15 +246,19 @@ services:
       PG_DATABASE: genieacs_funil
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      KAFKA_ALERTS_TOPIC: alertas-ftt
+      CONSUMER_GROUP_ID: ftt-consumer-group
+      RX_POWER_MIN_DBM: -27
+      RX_POWER_MAX_DBM: -8
     networks:
       - genieacs_network
 
 volumes:
-    data_db:
-    pg_data:
-    n8n_data:
-    data_configdb:
-    ext_volume:
+  data_db:
+  pg_data:
+  n8n_data:
+  data_configdb:
+  ext_volume:
 
 networks:
-    genieacs_network:
+  genieacs_network:

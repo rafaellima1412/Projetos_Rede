@@ -84,5 +84,4 @@
   <rect x="230" y="770" width="16" height="16" fill="#1c2128" stroke="#d4a72c" stroke-width="1.5" stroke-dasharray="4,3"/>
   <text x="254" y="783" fill="#9aa0a6" font-size="12">Pendente / próximo passo</text>
 
-  <text x="30" y="820" fill="#6e7681" font-size="11">Gerado com Claude — reflete o estado do projeto em Agosto/2026</text>
 </svg>
