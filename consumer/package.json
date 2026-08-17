@@ -1,0 +1,15 @@
+{
+  "name": "genieacs-consumer",
+  "version": "1.0.0",
+  "description": "Consumer Kafka -> Postgres + Redis, calcula funil de sucesso de instalação",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "pg": "^8.13.0",
+    "ioredis": "^5.4.1"
+  }
+}

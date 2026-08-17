@@ -24,7 +24,7 @@ services:
       - "7567"
       - "3000"
     volumes:
-      - ./extensions:/opt/genieacs/ext
+      - ext_volume:/opt/genieacs/ext
     networks:
       - genieacs_network
     healthcheck:
@@ -57,7 +57,7 @@ services:
       - "7567"
       - "3000"
     volumes:
-      - ./extensions:/opt/genieacs/ext
+      - ext_volume:/opt/genieacs/ext
     networks:
       - genieacs_network
     healthcheck:
@@ -119,7 +119,9 @@ services:
     image: drumsergio/genieacs-sim-container:latest
     container_name: genieacs-sim
     restart: unless-stopped
-    command: ["./genieacs-sim", "-u", "http://nginx:7547/", "-p", "100", "-w", "500"]
+    command: ["./genieacs-sim", "-u", "http://nginx:7547/", "-p", "100", "-w", "500", "-m", "/opt/genieacs-sim/data_model_extended.csv"]
+    volumes:
+      - ./data_model_extended.csv:/opt/genieacs-sim/data_model_extended.csv:ro
     networks:
       - genieacs_network
     profiles:
@@ -196,10 +198,69 @@ services:
     networks:
       - genieacs_network
 
+  ### PostgreSQL - histórico e funil de sucesso ###
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: genieacs_funil
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    networks:
+      - genieacs_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ### Redis - cache do último estado de cada CPE ###
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks:
+      - genieacs_network
+
+  ### Consumer - Kafka -> Postgres + Redis ###
+  consumer:
+    build: ./consumer
+    container_name: consumer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: device-events
+      NBI_HOST: nginx
+      NBI_PORT: 7557
+      PG_HOST: postgres
+      PG_PORT: 5432
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      PG_DATABASE: genieacs_funil
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    networks:
+      - genieacs_network
+
 volumes:
     data_db:
+    pg_data:
     n8n_data:
     data_configdb:
+    ext_volume:
 
 networks:
     genieacs_network:
